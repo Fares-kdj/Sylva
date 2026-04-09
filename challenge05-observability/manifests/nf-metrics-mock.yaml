@@ -1,0 +1,162 @@
+# ============================================================
+#  SYLVA-LAB – Challenge 5: NF Metrics Mock
+#  Exposes Prometheus-format metrics simulating a 5G AMF
+# ============================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nf-metrics-config
+  namespace: monitoring
+data:
+  server.js: |
+    const http = require('http');
+
+    let ueCount = 10;
+    let registrationRate = 5.2;
+    let sessionCount = 8;
+    let latencyMs = 12.4;
+    let errorRate = 0.02;
+
+    setInterval(() => {
+      ueCount     = Math.max(0, ueCount + Math.floor((Math.random()-0.4)*3));
+      sessionCount = Math.max(0, sessionCount + Math.floor((Math.random()-0.4)*2));
+      latencyMs   = Math.max(1, latencyMs + (Math.random()-0.5)*2);
+      registrationRate = Math.max(0, registrationRate + (Math.random()-0.5)*0.5);
+      errorRate   = Math.max(0, Math.min(1, errorRate + (Math.random()-0.5)*0.005));
+    }, 5000);
+
+    const server = http.createServer((req, res) => {
+      if (req.url === '/metrics' && req.method === 'GET') {
+        const metrics = [
+          '# HELP amf_registered_ue_count Number of currently registered UEs',
+          '# TYPE amf_registered_ue_count gauge',
+          `amf_registered_ue_count{plmn="20893",slice="default"} ${ueCount}`,
+          '',
+          '# HELP amf_ue_registration_rate_per_second UE registration rate',
+          '# TYPE amf_ue_registration_rate_per_second gauge',
+          `amf_ue_registration_rate_per_second{plmn="20893"} ${registrationRate.toFixed(2)}`,
+          '',
+          '# HELP amf_pdu_sessions_total Active PDU sessions',
+          '# TYPE amf_pdu_sessions_total gauge',
+          `amf_pdu_sessions_total{slice="default"} ${sessionCount}`,
+          '',
+          '# HELP amf_n2_latency_ms N2 interface latency (AMF-RAN)',
+          '# TYPE amf_n2_latency_ms histogram',
+          `amf_n2_latency_ms_bucket{le="5"}  ${Math.floor(ueCount*0.1)}`,
+          `amf_n2_latency_ms_bucket{le="10"} ${Math.floor(ueCount*0.5)}`,
+          `amf_n2_latency_ms_bucket{le="20"} ${Math.floor(ueCount*0.9)}`,
+          `amf_n2_latency_ms_bucket{le="+Inf"} ${ueCount}`,
+          `amf_n2_latency_ms_sum ${(latencyMs * ueCount).toFixed(1)}`,
+          `amf_n2_latency_ms_count ${ueCount}`,
+          '',
+          '# HELP amf_error_rate Proportion of failed NF requests',
+          '# TYPE amf_error_rate gauge',
+          `amf_error_rate{nf="AMF"} ${errorRate.toFixed(4)}`,
+          '',
+          '# HELP nf_up NF health status (1=up, 0=down)',
+          '# TYPE nf_up gauge',
+          'nf_up{nf="AMF",version="15.3.0"} 1',
+          'nf_up{nf="SMF",version="15.3.0"} 1',
+          'nf_up{nf="UPF",version="15.3.0"} 1',
+        ].join('\n');
+
+        res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
+        return res.end(metrics);
+      }
+
+      if (req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ status: 'UP', ueCount, sessionCount }));
+      }
+
+      res.writeHead(404);
+      res.end('Not found');
+    });
+
+    server.listen(9090, () => console.log('NF Metrics exporter on :9090'));
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nf-metrics-exporter
+  namespace: monitoring
+  labels:
+    app: nf-metrics-exporter
+    sylva-challenge: "05"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nf-metrics-exporter
+  template:
+    metadata:
+      labels:
+        app: nf-metrics-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: exporter
+          image: node:18-alpine
+          command: ["node", "/config/server.js"]
+          ports:
+            - containerPort: 9090
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: config
+          configMap:
+            name: nf-metrics-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nf-metrics-exporter
+  namespace: monitoring
+  labels:
+    app: nf-metrics-exporter
+spec:
+  selector:
+    app: nf-metrics-exporter
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+  type: ClusterIP
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nf-metrics
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: nf-metrics-exporter
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics

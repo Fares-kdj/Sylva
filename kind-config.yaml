@@ -1,0 +1,66 @@
+# ============================================================
+#  SYLVA-LAB – Kind Cluster Configuration
+#  1 control-plane + 2 worker nodes (edge + core)
+#  Tous les challenges partagent ce cluster
+# ============================================================
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+
+name: sylva-lab
+
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true,sylva-role=control-plane"
+            eviction-hard: "memory.available<200Mi"
+    extraPortMappings:
+      # ── Challenge 02 – AMF mock ────────────────────────────
+      - containerPort: 30002
+        hostPort: 8002
+        protocol: TCP
+      # ── Challenge 04 – Argo CD UI ─────────────────────────
+      - containerPort: 30080
+        hostPort: 8080
+        protocol: TCP
+      # ── Challenge 05 – Grafana ────────────────────────────
+      - containerPort: 30030
+        hostPort: 3030
+        protocol: TCP
+      # ── Challenge 06 – NF AMF + SMF ──────────────────────
+      - containerPort: 30101
+        hostPort: 8101
+        protocol: TCP
+      - containerPort: 30102
+        hostPort: 8102
+        protocol: TCP
+      # ── Challenge 08 – E2E: AMF + SMF + UPF ──────────────
+      - containerPort: 30201
+        hostPort: 8201
+        protocol: TCP
+      - containerPort: 30202
+        hostPort: 8202
+        protocol: TCP
+      - containerPort: 30203
+        hostPort: 8203
+        protocol: TCP
+
+  - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "sylva-site=edge,sylva-role=worker"
+
+  - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "sylva-site=core,sylva-role=worker"

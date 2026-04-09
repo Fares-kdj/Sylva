@@ -1,0 +1,73 @@
+# ============================================================
+#  SYLVA-LAB – Challenge 5: Prometheus Stack Helm Values
+#  Tuned for a lab environment (reduced resources)
+# ============================================================
+
+grafana:
+  enabled: true
+  adminPassword: "sylva-lab-2024"
+  service:
+    type: NodePort
+    nodePort: 30030
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "100m"
+    limits:
+      memory: "256Mi"
+      cpu: "200m"
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: sylva-nf
+          orgId: 1
+          folder: "5G Network Functions"
+          type: file
+          disableDeletion: false
+          options:
+            path: /var/lib/grafana/dashboards/sylva-nf
+
+prometheus:
+  prometheusSpec:
+    retention: 2h
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "200m"
+      limits:
+        memory: "512Mi"
+        cpu: "400m"
+    storageSpec: {}
+
+alertmanager:
+  enabled: false
+
+nodeExporter:
+  enabled: true
+
+kubeStateMetrics:
+  enabled: true
+
+defaultRules:
+  create: true
+  rules:
+    alertmanager: false
+    etcd: false
+    configReloaders: false
+    general: true
+    kubeApiserverAvailability: false
+    kubeApiserverBurnrate: false
+    kubeApiserverHistogram: false
+    kubeApiserverSlos: false
+    kubelet: true
+    kubeProxy: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    kubeStateMetrics: true
+    network: true
+    node: true
+    nodeExporterAlerting: true
+    nodeExporterRecording: true
+    prometheus: false
+    prometheusOperator: false

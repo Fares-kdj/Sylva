@@ -1,0 +1,488 @@
+# ============================================================
+#  SYLVA-LAB – Challenge 8: End-to-End Telco Scenario
+#  5G Core Flow: AMF → SMF → UPF
+#  Simulates a complete UE registration + data session setup
+# ============================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nf-e2e
+  labels:
+    sylva-challenge: "08"
+    scenario: 5g-core-flow
+
+---
+# ── UPF Mock ──────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: upf-config
+  namespace: nf-e2e
+data:
+  server.js: |
+    const http = require('http');
+    const { randomUUID } = require('crypto');
+
+    const tunnels = {};
+    let packetsForwarded = 0;
+
+    function respond(res, status, body) {
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body, null, 2));
+    }
+    function parseBody(req) {
+      return new Promise(r => {
+        let d = '';
+        req.on('data', c => d += c);
+        req.on('end', () => { try { r(JSON.parse(d || '{}')); } catch { r({}); } });
+      });
+    }
+
+    setInterval(() => {
+      Object.keys(tunnels).forEach(id => {
+        tunnels[id].packetsForwarded += Math.floor(Math.random() * 100);
+        tunnels[id].bytesForwarded   += Math.floor(Math.random() * 100000);
+      });
+    }, 2000);
+
+    const server = http.createServer(async (req, res) => {
+      const url = req.url; const method = req.method;
+      console.log(`[UPF] ${method} ${url}`);
+
+      if (url === '/health')
+        return respond(res, 200, { status:'UP', nf:'UPF', version:'15.3.0',
+          activeTunnels: Object.keys(tunnels).length });
+
+      if (url === '/nupf-user/v1/tunnels' && method === 'POST') {
+        const body = await parseBody(req);
+        const id = randomUUID();
+        const tunnel = {
+          tunnelId: id,
+          supi: body.supi,
+          teid: Math.floor(Math.random() * 100000),
+          ueIpv4: `10.${Math.floor(Math.random()*254)+1}.${Math.floor(Math.random()*254)+1}.${Math.floor(Math.random()*254)+1}`,
+          dnn: body.dnn || 'internet',
+          qfi: body.qfi || 1,
+          uplinkGtpuAddress: 'upf.nf-e2e.svc.cluster.local',
+          createdAt: new Date().toISOString(),
+          packetsForwarded: 0,
+          bytesForwarded: 0
+        };
+        tunnels[id] = tunnel;
+        console.log(`[UPF] GTP-U tunnel created for ${body.supi}: ${tunnel.ueIpv4}`);
+        return respond(res, 201, tunnel);
+      }
+
+      if (url === '/nupf-user/v1/tunnels' && method === 'GET')
+        return respond(res, 200, Object.values(tunnels));
+
+      if (url === '/nupf-user/v1/stats' && method === 'GET')
+        return respond(res, 200, {
+          activeTunnels: Object.keys(tunnels).length,
+          totalPackets: Object.values(tunnels).reduce((a, t) => a + t.packetsForwarded, 0),
+          totalBytes: Object.values(tunnels).reduce((a, t) => a + t.bytesForwarded, 0)
+        });
+
+      respond(res, 404, { error: `Not found: ${method} ${url}` });
+    });
+    server.listen(8080, () => console.log('[UPF] UPF Mock on :8080'));
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: upf
+  namespace: nf-e2e
+  labels:
+    app: upf
+    nf-type: UPF
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: upf
+  template:
+    metadata:
+      labels:
+        app: upf
+        nf-type: UPF
+    spec:
+      nodeSelector:
+        sylva-site: core
+      containers:
+        - name: upf
+          image: node:18-alpine
+          command: ["node", "/config/server.js"]
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: config
+          configMap:
+            name: upf-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: upf
+  namespace: nf-e2e
+  labels:
+    app: upf
+    nf-type: UPF
+spec:
+  selector:
+    app: upf
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 30203
+  type: NodePort
+
+---
+# ── SMF Mock (calls UPF) ──────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smf-e2e-config
+  namespace: nf-e2e
+data:
+  server.js: |
+    const http = require('http');
+    const { randomUUID } = require('crypto');
+
+    const UPF_URL = process.env.UPF_SERVICE_URL || 'http://upf.nf-e2e.svc.cluster.local:8080';
+    const sessions = {};
+
+    function respond(res, status, body) {
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body, null, 2));
+    }
+    function parseBody(req) {
+      return new Promise(r => {
+        let d = '';
+        req.on('data', c => d += c);
+        req.on('end', () => { try { r(JSON.parse(d || '{}')); } catch { r({}); } });
+      });
+    }
+    function callUpf(path, method, body) {
+      return new Promise((resolve, reject) => {
+        const url = new URL(UPF_URL + path);
+        const data = body ? JSON.stringify(body) : null;
+        const r = http.request({
+          hostname: url.hostname, port: url.port || 8080,
+          path: url.pathname, method,
+          headers: { 'Content-Type': 'application/json' }
+        }, resp => {
+          let d = '';
+          resp.on('data', c => d += c);
+          resp.on('end', () => {
+            try { resolve({ status: resp.statusCode, body: JSON.parse(d) }); }
+            catch { resolve({ status: resp.statusCode, body: d }); }
+          });
+        });
+        r.on('error', reject);
+        if (data) r.write(data);
+        r.end();
+      });
+    }
+
+    const server = http.createServer(async (req, res) => {
+      const url = req.url; const method = req.method;
+      console.log(`[SMF] ${method} ${url}`);
+
+      if (url === '/health')
+        return respond(res, 200, { status:'UP', nf:'SMF', upfUrl: UPF_URL });
+
+      if (url === '/nsmf-pdusession/v1/sm-contexts' && method === 'POST') {
+        const body = await parseBody(req);
+        if (!body.supi) return respond(res, 400, { error: 'Missing supi' });
+        try {
+          console.log(`[SMF] Calling UPF for tunnel – supi: ${body.supi}`);
+          const upfResp = await callUpf('/nupf-user/v1/tunnels', 'POST', {
+            supi: body.supi, dnn: body.dnn || 'internet', qfi: 1
+          });
+          const id = randomUUID();
+          const session = {
+            smContextRef: id, supi: body.supi,
+            dnn: body.dnn || 'internet',
+            pduSessionType: 'IPV4',
+            upfTunnel: upfResp.body,
+            smfToUpfCall: `SMF → UPF (${UPF_URL})`,
+            createdAt: new Date().toISOString()
+          };
+          sessions[id] = session;
+          return respond(res, 201, session);
+        } catch (e) {
+          return respond(res, 503, { error: `UPF unreachable: ${e.message}` });
+        }
+      }
+
+      if (url === '/nsmf-pdusession/v1/sm-contexts' && method === 'GET')
+        return respond(res, 200, Object.values(sessions));
+
+      respond(res, 404, { error: `Not found: ${method} ${url}` });
+    });
+    server.listen(8080, () => {
+      console.log('[SMF] SMF Mock (with UPF integration) on :8080');
+      console.log(`[SMF] UPF endpoint: ${UPF_URL}`);
+    });
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smf
+  namespace: nf-e2e
+  labels:
+    app: smf
+    nf-type: SMF
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: smf
+  template:
+    metadata:
+      labels:
+        app: smf
+        nf-type: SMF
+    spec:
+      nodeSelector:
+        sylva-site: core
+      containers:
+        - name: smf
+          image: node:18-alpine
+          command: ["node", "/config/server.js"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: UPF_SERVICE_URL
+              value: "http://upf.nf-e2e.svc.cluster.local:8080"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: config
+          configMap:
+            name: smf-e2e-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: smf
+  namespace: nf-e2e
+  labels:
+    app: smf
+    nf-type: SMF
+spec:
+  selector:
+    app: smf
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 30202
+  type: NodePort
+
+---
+# ── AMF Mock (orchestrates the full flow) ─────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amf-e2e-config
+  namespace: nf-e2e
+data:
+  server.js: |
+    const http = require('http');
+    const { randomUUID } = require('crypto');
+
+    const SMF_URL = process.env.SMF_SERVICE_URL || 'http://smf.nf-e2e.svc.cluster.local:8080';
+    const registrations = {};
+
+    function respond(res, status, body) {
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body, null, 2));
+    }
+    function parseBody(req) {
+      return new Promise(r => {
+        let d = '';
+        req.on('data', c => d += c);
+        req.on('end', () => { try { r(JSON.parse(d || '{}')); } catch { r({}); } });
+      });
+    }
+    function callSmf(path, method, body) {
+      return new Promise((resolve, reject) => {
+        const url = new URL(SMF_URL + path);
+        const data = body ? JSON.stringify(body) : null;
+        const r = http.request({
+          hostname: url.hostname, port: url.port || 8080,
+          path: url.pathname, method,
+          headers: { 'Content-Type': 'application/json' }
+        }, resp => {
+          let d = '';
+          resp.on('data', c => d += c);
+          resp.on('end', () => {
+            try { resolve({ status: resp.statusCode, body: JSON.parse(d) }); }
+            catch { resolve({ status: resp.statusCode, body: d }); }
+          });
+        });
+        r.on('error', reject);
+        if (data) r.write(data);
+        r.end();
+      });
+    }
+
+    const server = http.createServer(async (req, res) => {
+      const url = req.url; const method = req.method;
+      console.log(`[AMF] ${method} ${url}`);
+
+      if (url === '/health')
+        return respond(res, 200, { status:'UP', nf:'AMF', smfUrl: SMF_URL });
+
+      // Full 5G registration + data session flow
+      if (url === '/namf-comm/v1/ue-complete-registration' && method === 'POST') {
+        const body = await parseBody(req);
+        if (!body.supi) return respond(res, 400, { error: 'Missing supi' });
+
+        const steps = [];
+        const regId = randomUUID();
+
+        // Step 1: AMF registers UE
+        steps.push({ step: 1, action: 'AMF: UE Registration', supi: body.supi, regId, status: 'REGISTERED' });
+        registrations[regId] = { supi: body.supi, regId };
+
+        // Step 2: AMF triggers SMF for PDU session
+        let smfResult;
+        try {
+          const smfResp = await callSmf('/nsmf-pdusession/v1/sm-contexts', 'POST', {
+            supi: body.supi, dnn: body.dnn || 'internet'
+          });
+          smfResult = smfResp.body;
+          steps.push({ step: 2, action: 'AMF → SMF: PDU Session Request', smContextRef: smfResult.smContextRef, status: 'CREATED' });
+          steps.push({ step: 3, action: 'SMF → UPF: GTP-U Tunnel', ueIpv4: smfResult.upfTunnel?.ueIpv4, teid: smfResult.upfTunnel?.teid, status: 'ESTABLISHED' });
+        } catch (e) {
+          steps.push({ step: 2, action: 'AMF → SMF call FAILED', error: e.message });
+        }
+
+        return respond(res, 201, {
+          scenario: '5G Core Registration + Data Session',
+          flow: 'AMF → SMF → UPF',
+          supi: body.supi,
+          steps,
+          smfSession: smfResult || null
+        });
+      }
+
+      if (url === '/namf-comm/v1/ue-registrations' && method === 'GET')
+        return respond(res, 200, Object.values(registrations));
+
+      respond(res, 404, { error: `Not found: ${method} ${url}` });
+    });
+    server.listen(8080, () => {
+      console.log('[AMF] AMF E2E Mock (AMF→SMF→UPF) on :8080');
+      console.log(`[AMF] SMF endpoint: ${SMF_URL}`);
+    });
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amf
+  namespace: nf-e2e
+  labels:
+    app: amf
+    nf-type: AMF
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: amf
+  template:
+    metadata:
+      labels:
+        app: amf
+        nf-type: AMF
+    spec:
+      nodeSelector:
+        sylva-site: core
+      containers:
+        - name: amf
+          image: node:18-alpine
+          command: ["node", "/config/server.js"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: SMF_SERVICE_URL
+              value: "http://smf.nf-e2e.svc.cluster.local:8080"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: config
+          configMap:
+            name: amf-e2e-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amf
+  namespace: nf-e2e
+  labels:
+    app: amf
+    nf-type: AMF
+spec:
+  selector:
+    app: amf
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 30201
+  type: NodePort

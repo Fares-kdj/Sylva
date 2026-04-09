@@ -1,0 +1,178 @@
+# ============================================================
+#  SYLVA-LAB – Challenge 2: Kubernetes Fundamentals
+#  AMF Mock – Simulates a 5G Access & Mobility Management Function
+# ============================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nf-5g
+  labels:
+    sylva-challenge: "02"
+    network-slice: "default"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amf-config
+  namespace: nf-5g
+data:
+  server.js: |
+    const http = require('http');
+    const { randomUUID } = require('crypto');
+
+    const registrations = {};
+    const NF_NAME = 'AMF';
+    const NF_TYPE = 'AMF';
+    const NF_VERSION = '15.3.0';
+
+    function respond(res, status, body) {
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body, null, 2));
+    }
+
+    function parseBody(req) {
+      return new Promise(resolve => {
+        let d = '';
+        req.on('data', c => d += c);
+        req.on('end', () => { try { resolve(JSON.parse(d || '{}')); } catch { resolve({}); } });
+      });
+    }
+
+    const server = http.createServer(async (req, res) => {
+      const url = req.url;
+      const method = req.method;
+      console.log(`[AMF] ${method} ${url}`);
+
+      if (url === '/health' && method === 'GET')
+        return respond(res, 200, { status: 'UP', nf: NF_NAME, version: NF_VERSION, instance: process.env.POD_NAME || 'amf-0' });
+
+      if (url === '/namf-comm/v1/nf-info' && method === 'GET')
+        return respond(res, 200, { nfType: NF_TYPE, nfStatus: 'REGISTERED', nfInstanceId: randomUUID(), ipv4Addresses: ['10.0.0.1'] });
+
+      if (url === '/namf-comm/v1/ue-registrations' && method === 'GET')
+        return respond(res, 200, Object.values(registrations));
+
+      if (url === '/namf-comm/v1/ue-registrations' && method === 'POST') {
+        const body = await parseBody(req);
+        if (!body.supi) return respond(res, 400, { error: 'Missing supi (subscriber identity)' });
+        const id = randomUUID();
+        const reg = {
+          registrationId: id,
+          supi: body.supi,
+          ranUeNgapId: body.ranUeNgapId || Math.floor(Math.random() * 1000),
+          registrationTime: new Date().toISOString(),
+          registrationStatus: 'REGISTERED',
+          plmnId: body.plmnId || { mcc: '208', mnc: '93' },
+          amfUeNgapId: Math.floor(Math.random() * 10000)
+        };
+        registrations[id] = reg;
+        console.log(`[AMF] UE registered: ${body.supi}`);
+        return respond(res, 201, reg);
+      }
+
+      const ueMatch = url.match(/^\/namf-comm\/v1\/ue-registrations\/([^/]+)$/);
+      if (ueMatch) {
+        const reg = registrations[ueMatch[1]];
+        if (!reg) return respond(res, 404, { error: 'Registration not found' });
+        if (method === 'GET')    return respond(res, 200, reg);
+        if (method === 'DELETE') {
+          delete registrations[ueMatch[1]];
+          res.writeHead(204); return res.end();
+        }
+      }
+
+      respond(res, 404, { error: `Route not found: ${method} ${url}` });
+    });
+
+    server.listen(8080, () => {
+      console.log(`[AMF] 5G AMF Mock started on :8080`);
+      console.log(`[AMF] NF: ${NF_NAME} v${NF_VERSION}`);
+    });
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amf
+  namespace: nf-5g
+  labels:
+    app: amf
+    nf-type: AMF
+    sylva-challenge: "02"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: amf
+  template:
+    metadata:
+      labels:
+        app: amf
+        nf-type: AMF
+        network-slice: default
+    spec:
+      nodeSelector:
+        sylva-site: core
+      containers:
+        - name: amf
+          image: node:18-alpine
+          command: ["node", "/config/server.js"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: amf-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amf
+  namespace: nf-5g
+  labels:
+    app: amf
+    nf-type: AMF
+spec:
+  selector:
+    app: amf
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 30002
+  type: NodePort

@@ -1,0 +1,262 @@
+# ============================================================
+#  SYLVA-LAB – Challenge 7: Security and Isolation in Telco
+#  RBAC, NetworkPolicy, Secrets for NF isolation
+# ============================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nf-security
+  labels:
+    sylva-challenge: "07"
+    network-slice: isolated
+
+---
+# ── ServiceAccounts ───────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: amf-sa
+  namespace: nf-security
+  labels:
+    nf-type: AMF
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: smf-sa
+  namespace: nf-security
+  labels:
+    nf-type: SMF
+
+---
+# ── Roles ─────────────────────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: amf-role
+  namespace: nf-security
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: smf-role
+  namespace: nf-security
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list"]
+
+---
+# ── RoleBindings ──────────────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: amf-rolebinding
+  namespace: nf-security
+subjects:
+  - kind: ServiceAccount
+    name: amf-sa
+    namespace: nf-security
+roleRef:
+  kind: Role
+  name: amf-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: smf-rolebinding
+  namespace: nf-security
+subjects:
+  - kind: ServiceAccount
+    name: smf-sa
+    namespace: nf-security
+roleRef:
+  kind: Role
+  name: smf-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ── Secrets (simulated telco config) ─────────────────────────────────────────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: amf-credentials
+  namespace: nf-security
+  labels:
+    nf-type: AMF
+type: Opaque
+stringData:
+  plmn-id: "20893"
+  operator-key: "sylva-lab-amf-key-2024"
+  n2-cert: "-----BEGIN CERTIFICATE-----\nMIIB...simulated...AMF...cert\n-----END CERTIFICATE-----"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: smf-credentials
+  namespace: nf-security
+  labels:
+    nf-type: SMF
+type: Opaque
+stringData:
+  plmn-id: "20893"
+  upf-key: "sylva-lab-smf-upf-key-2024"
+  n4-cert: "-----BEGIN CERTIFICATE-----\nMIIB...simulated...SMF...cert\n-----END CERTIFICATE-----"
+
+---
+# ── NetworkPolicy: deny all ingress by default ────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: nf-security
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+
+---
+# ── NetworkPolicy: AMF can only receive from SMF ─────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: amf-ingress-policy
+  namespace: nf-security
+spec:
+  podSelector:
+    matchLabels:
+      app: amf
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: smf
+      ports:
+        - protocol: TCP
+          port: 8080
+
+---
+# ── NetworkPolicy: SMF can only receive from AMF ─────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: smf-ingress-policy
+  namespace: nf-security
+spec:
+  podSelector:
+    matchLabels:
+      app: smf
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: amf
+      ports:
+        - protocol: TCP
+          port: 8080
+
+---
+# ── AMF Deployment (with SA + secret mount) ───────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amf-sec-config
+  namespace: nf-security
+data:
+  server.js: |
+    const http = require('http');
+    const fs = require('fs');
+
+    const plmnId   = fs.existsSync('/secrets/plmn-id')    ? fs.readFileSync('/secrets/plmn-id','utf8').trim()    : 'unknown';
+    const opKey    = fs.existsSync('/secrets/operator-key')? fs.readFileSync('/secrets/operator-key','utf8').trim(): 'unknown';
+
+    const server = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (req.url === '/health')
+        return res.end(JSON.stringify({ status:'UP', nf:'AMF', plmnId, secretLoaded: opKey !== 'unknown' }));
+      if (req.url === '/config')
+        return res.end(JSON.stringify({ plmnId, keyPresent: opKey.length > 0 }));
+      res.end(JSON.stringify({ error: 'Not found' }));
+    });
+    server.listen(8080, () => console.log('[AMF-SEC] AMF Security mock on :8080'));
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amf
+  namespace: nf-security
+  labels:
+    app: amf
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: amf
+  template:
+    metadata:
+      labels:
+        app: amf
+        nf-type: AMF
+    spec:
+      serviceAccountName: amf-sa
+      nodeSelector:
+        sylva-site: core
+      containers:
+        - name: amf
+          image: node:18-alpine
+          command: ["node", "/config/server.js"]
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: amf-sec-config
+        - name: secrets
+          secret:
+            secretName: amf-credentials
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amf
+  namespace: nf-security
+spec:
+  selector:
+    app: amf
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP

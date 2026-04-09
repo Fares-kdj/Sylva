@@ -1,0 +1,32 @@
+# ============================================================
+#  SYLVA-LAB – Challenge 4: GitOps
+#  Argo CD Application – deploys AMF NF from local manifests
+# ============================================================
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: amf-nf
+  namespace: argocd
+  labels:
+    sylva-challenge: "04"
+    nf-type: AMF
+spec:
+  project: default
+  source:
+    repoURL: https://gitlab.com/sylva-projects/sylva-core.git
+    targetRevision: HEAD
+    path: .
+    directory:
+      recurse: false
+      include: "*.yaml"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: nf-5g
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: false
+    syncOptions:
+      - CreateNamespace=true
