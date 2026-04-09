@@ -16,7 +16,7 @@ spec:
   project: default
   source:
     repoURL: https://gitlab.com/sylva-projects/sylva-core.git
-    targetRevision: HEAD
+    targetRevision: release-1.6
     path: .
     directory:
       recurse: false

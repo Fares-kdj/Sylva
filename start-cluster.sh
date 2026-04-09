@@ -90,13 +90,22 @@ echo -e "${YELLOW}[4/4] Cloning Sylva repository...${NC}"
 
 SYLVA_DIR="${SCRIPT_DIR}/sylva-core"
 if [ -d "$SYLVA_DIR/.git" ]; then
-  echo -e "${GREEN}  ✓ sylva-core already cloned – pulling latest...${NC}"
-  git -C "$SYLVA_DIR" pull --ff-only 2>/dev/null || \
-    echo -e "${YELLOW}  ⚠ Could not pull (local changes?) – skipping update.${NC}"
-else
-  echo "  → Cloning gitlab.com/sylva-projects/sylva-core..."
-  git clone --depth=1 https://gitlab.com/sylva-projects/sylva-core.git "$SYLVA_DIR" 2>&1 | tail -3
-  echo -e "${GREEN}  ✓ sylva-core cloned.${NC}"
+  # Check if we are on the right branch
+  CURRENT_BRANCH=$(git -C "$SYLVA_DIR" branch --show-current)
+  if [ "$CURRENT_BRANCH" != "release-1.6" ]; then
+    echo -e "${YELLOW}  ⚠ sylva-core is on branch '$CURRENT_BRANCH', but we need 'release-1.6'. Re-cloning...${NC}"
+    rm -rf "$SYLVA_DIR"
+  else
+    echo -e "${GREEN}  ✓ sylva-core (branch release-1.6) already cloned – pulling latest...${NC}"
+    git -C "$SYLVA_DIR" pull origin release-1.6 --ff-only 2>/dev/null || \
+      echo -e "${YELLOW}  ⚠ Could not pull (local changes?) – skipping update.${NC}"
+  fi
+fi
+
+if [ ! -d "$SYLVA_DIR/.git" ]; then
+  echo "  → Cloning gitlab.com/sylva-projects/sylva-core (branch: release-1.6)..."
+  git clone --depth=1 -b release-1.6 https://gitlab.com/sylva-projects/sylva-core.git "$SYLVA_DIR" 2>&1 | tail -3
+  echo -e "${GREEN}  ✓ sylva-core (release-1.6) cloned.${NC}"
 fi
 
 echo ""
